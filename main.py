@@ -159,11 +159,10 @@ def get_ffmpeg_options(guild_id):
 
     return ffmpeg_options
 
-
 def get_track_info(track):
     """Extract and validate track information from yt-dlp results"""
-    # Handle common format issues
     if not track:
+        print("[ERROR] Track object is None.")
         return {
             "title": "Unknown",
             "url": "",
@@ -174,26 +173,29 @@ def get_track_info(track):
             "view_count": 0,
             "id": ""
         }
-    
-    # Check for direct URL in formats
+
     direct_url = None
-    if "formats" in track and track["formats"]:
-        for fmt in track["formats"]:
-            if fmt.get("url") and fmt.get("acodec") != "none":
-                direct_url = fmt.get("url")
-                break
-    
-    # Fall back to the main URL if no format URLs found
-    final_url = direct_url or track.get("url", "")
-    
-    # Debugging
-    if not final_url:
-        print(f"Warning: No playable URL found for track {track.get('title', 'Unknown')}")
-        print(f"Available keys: {list(track.keys())}")
-    
+    try:
+        if "formats" in track and isinstance(track["formats"], list):
+            for fmt in track["formats"]:
+                if fmt.get("url") and fmt.get("acodec") != "none":
+                    direct_url = fmt["url"]
+                    break
+    except Exception as e:
+        print(f"[ERROR] Exception while parsing formats: {e}")
+
+    if not direct_url:
+        # Fallback to track['url'] if available
+        fallback_url = track.get("url", "")
+        if not fallback_url:
+            print(f"[ERROR] No playable audio URL found for: {track.get('title', 'Unknown')}")
+        direct_url = fallback_url
+
+    print(f"[INFO] Resolved audio URL: {direct_url if direct_url else 'None'}")
+
     return {
         "title": track.get("title", "Unknown"),
-        "url": final_url,
+        "url": direct_url,
         "webpage_url": track.get("webpage_url", track.get("original_url", "")),
         "thumbnail": track.get("thumbnail", ""),
         "duration": track.get("duration", 0),
