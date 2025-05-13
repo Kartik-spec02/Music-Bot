@@ -1,0 +1,1327 @@
+import os
+import discord
+from discord.ext import commands
+from discord import app_commands
+from dotenv import load_dotenv
+import yt_dlp
+from collections import deque
+import asyncio
+import random
+import time
+import json
+import re
+from typing import Optional, List, Dict, Any
+
+# Load environment variables
+load_dotenv()
+TOKEN = os.getenv("DISCORD_TOKEN")  # Move token to .env file for security
+
+# Global variables
+SONG_QUEUES = {}  # Guild ID -> deque of songs
+VOLUME_LEVELS = {}  # Guild ID -> volume level
+SONG_HISTORY = {}  # Guild ID -> list of recently played songs
+SONG_RATINGS = {}  # Guild ID -> {song_id -> rating}
+CUSTOM_PLAYLISTS = {}  # User ID -> {playlist_name -> [songs]}
+CURRENT_TRACKS = {}  # Guild ID -> current track info
+VOICE_CHANNEL_LOCKS = {}  # Guild ID -> boolean
+AUTO_JOIN_CHANNELS = {}  # User ID -> Guild ID -> Channel ID
+FILTERS = {}  # Guild ID -> list of active filters
+SONG_TIMESTAMPS = {}  # Guild ID -> current song timestamp
+NIGHTCORE_ENABLED = {}  # Guild ID -> boolean
+EQUALIZER_SETTINGS = {}  # Guild ID -> {band -> value}
+AUDIO_BALANCE = {}  # Guild ID -> (left, right) balance values
+LANGUAGE_PREFERENCES = {}  # User ID -> language code
+ACTIVE_GAME_SESSIONS = {}  # Guild ID -> game session
+
+# Define supported languages
+SUPPORTED_LANGUAGES = {
+    "en": "English",
+    "es": "Spanish",
+    "fr": "French",
+    "de": "German",
+    "it": "Italian",
+    "pt": "Portuguese",
+    "ru": "Russian",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "zh": "Chinese",
+    "nl": "Dutch"
+}
+
+# Define audio filters
+AVAILABLE_FILTERS = {
+    "bassboost": "aresample=48000,aformat=sample_fmts=s16:channel_layouts=stereo,bass=g=10",
+    "nightcore": "aresample=48000,asetrate=48000*1.25,aformat=sample_fmts=s16:channel_layouts=stereo",
+    "8d": "apulsator=hz=0.09",
+    "vaporwave": "aresample=48000,asetrate=48000*0.8,aformat=sample_fmts=s16:channel_layouts=stereo",
+    "tremolo": "tremolo=f=6.0:d=0.8",
+    "vibrato": "vibrato=f=6.5:d=0.5",
+    "reverse": "areverse",
+    "normalizer": "dynaudnorm=f=200",
+    "echo": "aecho=0.8:0.88:60:0.4"
+}
+
+# Audio visualizer settings (placeholder for now)
+VISUALIZER_ACTIVE = {}  # Guild ID -> boolean
+
+# Setup intents
+intents = discord.Intents.default()
+intents.message_content = True
+intents.voice_states = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# YT-DLP options
+ydl_opts_base = {
+    "format": "bestaudio[abr<=128]/bestaudio",
+    "noplaylist": True,
+    "youtube_include_dash_manifest": False,
+    "youtube_include_hls_manifest": False,
+    "quiet": True,
+    "no_warnings": True,
+}
+
+# Helper functions
+async def search_ytdlp_async(query, ydl_opts):
+    """Run yt-dlp in a thread pool to avoid blocking the event loop"""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: _extract(query, ydl_opts))
+
+def _extract(query, ydl_opts):
+    """Extract info from yt-dlp"""
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        return ydl.extract_info(query, download=False)
+
+def get_ffmpeg_options(guild_id):
+    """Get ffmpeg options with active filters"""
+    filters = FILTERS.get(str(guild_id), [])
+    
+    # Apply nightcore if enabled
+    if NIGHTCORE_ENABLED.get(str(guild_id), False) and "nightcore" not in filters:
+        filters.append("nightcore")
+    
+    ffmpeg_options = {
+        "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+        "options": "-vn",
+    }
+    
+    # Apply audio filters if any are active
+    if filters:
+        filter_string = ",".join([AVAILABLE_FILTERS[f] for f in filters if f in AVAILABLE_FILTERS])
+        if filter_string:
+            ffmpeg_options["options"] += f" -af \"{filter_string}\""
+    
+    return ffmpeg_options
+
+def get_track_info(track):
+    """Extract useful track information"""
+    return {
+        "title": track.get("title", "Unknown"),
+        "url": track.get("url", ""),
+        "webpage_url": track.get("webpage_url", ""),
+        "thumbnail": track.get("thumbnail", ""),
+        "duration": track.get("duration", 0),
+        "uploader": track.get("uploader", "Unknown"),
+        "view_count": track.get("view_count", 0),
+        "id": track.get("id", "")
+    }
+
+def format_duration(seconds):
+    """Format seconds into mm:ss or hh:mm:ss"""
+    if not seconds:
+        return "Unknown"
+    
+    minutes, seconds = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    else:
+        return f"{minutes:02d}:{seconds:02d}"
+
+def calculate_queue_time(guild_id):
+    """Calculate total queue time"""
+    queue = SONG_QUEUES.get(str(guild_id), deque())
+    total_time = 0
+    for _, _, duration in queue:
+        total_time += duration or 0
+    return total_time
+
+def save_data():
+    """Save persistent data to a file"""
+    data = {
+        "song_ratings": SONG_RATINGS,
+        "custom_playlists": CUSTOM_PLAYLISTS,
+        "voice_channel_locks": VOICE_CHANNEL_LOCKS,
+        "auto_join_channels": AUTO_JOIN_CHANNELS,
+        "equalizer_settings": EQUALIZER_SETTINGS,
+        "language_preferences": LANGUAGE_PREFERENCES,
+    }
+    
+    with open("music_bot_data.json", "w") as f:
+        json.dump(data, f)
+
+def load_data():
+    """Load persistent data from a file"""
+    global SONG_RATINGS, CUSTOM_PLAYLISTS, VOICE_CHANNEL_LOCKS, AUTO_JOIN_CHANNELS, EQUALIZER_SETTINGS, LANGUAGE_PREFERENCES
+    
+    try:
+        with open("music_bot_data.json", "r") as f:
+            data = json.load(f)
+            
+        SONG_RATINGS = data.get("song_ratings", {})
+        CUSTOM_PLAYLISTS = data.get("custom_playlists", {})
+        VOICE_CHANNEL_LOCKS = data.get("voice_channel_locks", {})
+        AUTO_JOIN_CHANNELS = data.get("auto_join_channels", {})
+        EQUALIZER_SETTINGS = data.get("equalizer_settings", {})
+        LANGUAGE_PREFERENCES = data.get("language_preferences", {})
+    except (FileNotFoundError, json.JSONDecodeError):
+        # If file doesn't exist or is invalid, use empty defaults
+        pass
+
+# Core functions for music playback
+async def play_next_song(voice_client, guild_id, channel):
+    """Play the next song in the queue"""
+    guild_id_str = str(guild_id)
+    
+    if not voice_client or not voice_client.is_connected():
+        SONG_QUEUES[guild_id_str] = deque()
+        return
+    
+    if SONG_QUEUES[guild_id_str]:
+        audio_url, title, duration = SONG_QUEUES[guild_id_str].popleft()
+        
+        # Store current song info for "now playing" command
+        CURRENT_TRACKS[guild_id_str] = {
+            "title": title,
+            "url": audio_url,
+            "started_at": time.time(),
+            "duration": duration
+        }
+        
+        # Reset timestamp
+        SONG_TIMESTAMPS[guild_id_str] = 0
+        
+        # Get ffmpeg options with current filters
+        ffmpeg_options = get_ffmpeg_options(guild_id)
+        
+        # Create audio source
+        try:
+            source = discord.FFmpegPCMAudio(audio_url, **ffmpeg_options, executable="bin\\ffmpeg\\ffmpeg.exe")
+            volume = VOLUME_LEVELS.get(guild_id_str, 0.5)
+            source = discord.PCMVolumeTransformer(source, volume=volume)
+            
+            def after_play(error):
+                if error:
+                    print(f"Error playing {title}: {error}")
+                # Add to history
+                if guild_id_str not in SONG_HISTORY:
+                    SONG_HISTORY[guild_id_str] = []
+                if len(SONG_HISTORY[guild_id_str]) >= 50:  # Limit history size
+                    SONG_HISTORY[guild_id_str].pop(0)
+                SONG_HISTORY[guild_id_str].append((audio_url, title, duration))
+                
+                # Play next song
+                asyncio.run_coroutine_threadsafe(play_next_song(voice_client, guild_id, channel), bot.loop)
+            
+            voice_client.play(source, after=after_play)
+            
+            # Send now playing message
+            embed = discord.Embed(
+                title="🎵 Now Playing",
+                description=f"**{title}**",
+                color=discord.Color.green()
+            )
+            if duration:
+                embed.add_field(name="Duration", value=format_duration(duration))
+            
+            await channel.send(embed=embed)
+            
+        except Exception as e:
+            await channel.send(f"⚠️ Error playing track: {e}")
+            # Try to play the next song
+            asyncio.create_task(play_next_song(voice_client, guild_id, channel))
+    else:
+        # Clear current track info
+        if guild_id_str in CURRENT_TRACKS:
+            del CURRENT_TRACKS[guild_id_str]
+
+# Bot events
+@bot.event
+async def on_ready():
+    print(f"{bot.user} is online!")
+    load_data()  # Load saved data
+    
+    # Set up periodic data save
+    async def auto_save_data():
+        while True:
+            await asyncio.sleep(300)  # Save every 5 minutes
+            save_data()
+            print("Data auto-saved")
+    
+    bot.loop.create_task(auto_save_data())
+    
+    try:
+        await bot.tree.sync()
+        print("Commands synced!")
+        commands = bot.tree.get_commands()
+        print(f"Registered {len(commands)} commands:")
+        for cmd in commands:
+            print(f"- /{cmd.name}")
+    except Exception as e:
+        print(f"Error syncing commands: {e}")
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    """Handle voice state updates for auto-join/leave functionality"""
+    if member.bot:
+        return
+    
+    # Handle auto-join
+    if before.channel is None and after.channel is not None:
+        # User joined a voice channel
+        user_id_str = str(member.id)
+        guild_id_str = str(member.guild.id)
+        
+        # Check if the user has auto-join enabled for this guild
+        if user_id_str in AUTO_JOIN_CHANNELS and guild_id_str in AUTO_JOIN_CHANNELS[user_id_str]:
+            if str(after.channel.id) == AUTO_JOIN_CHANNELS[user_id_str][guild_id_str]:
+                # Auto-join is enabled for this channel
+                if not member.guild.voice_client or not member.guild.voice_client.is_connected():
+                    await after.channel.connect()
+    
+    # Check if bot should disconnect when alone
+    if before.channel is not None and len(before.channel.members) == 1:
+        # Check if the only member left is the bot
+        if before.channel.members[0].id == bot.user.id:
+            voice_client = before.channel.guild.voice_client
+            if voice_client and voice_client.is_connected():
+                await voice_client.disconnect()
+                guild_id_str = str(before.channel.guild.id)
+                if guild_id_str in SONG_QUEUES:
+                    SONG_QUEUES[guild_id_str].clear()
+                if guild_id_str in CURRENT_TRACKS:
+                    del CURRENT_TRACKS[guild_id_str]
+
+# Core Playback Controls
+@bot.tree.command(name="play", description="Play a song or add it to the queue.")
+@app_commands.describe(song_query="Search query or YouTube URL")
+async def play(interaction: discord.Interaction, song_query: str):
+    await interaction.response.defer()
+    
+    # Check if user is in a voice channel
+    if not interaction.user.voice:
+        return await interaction.followup.send("❌ You must be in a voice channel to use this command.")
+        
+    voice_channel = interaction.user.voice.channel
+    
+    # Check for voice channel lock
+    guild_id_str = str(interaction.guild_id)
+    if guild_id_str in VOICE_CHANNEL_LOCKS and VOICE_CHANNEL_LOCKS[guild_id_str]:
+        # Check if bot is in a different channel
+        if interaction.guild.voice_client and interaction.guild.voice_client.channel != voice_channel:
+            return await interaction.followup.send("❌ Voice channel is locked. The bot can only play in its current channel.")
+    
+    # Connect to the voice channel if not already connected
+    voice_client = interaction.guild.voice_client
+    if voice_client is None:
+        voice_client = await voice_channel.connect()
+    elif voice_channel != voice_client.channel:
+        await voice_client.move_to(voice_channel)
+    
+    # Set up queue if it doesn't exist
+    if guild_id_str not in SONG_QUEUES:
+        SONG_QUEUES[guild_id_str] = deque()
+    
+    # Set default volume if not set
+    if guild_id_str not in VOLUME_LEVELS:
+        VOLUME_LEVELS[guild_id_str] = 0.5
+    
+    # Handle URL or search query
+    query = song_query
+    if not query.startswith("http"):
+        query = "ytsearch1:" + song_query
+    
+    try:
+        results = await search_ytdlp_async(query, ydl_opts_base)
+        
+        if "entries" in results:
+            # Playlist handling
+            tracks = results["entries"]
+            if not tracks:
+                return await interaction.followup.send("❌ No results found.")
+            
+            # For now, we'll just take the first result
+            first_track = tracks[0]
+        else:
+            # Single video
+            first_track = results
+        
+        info = get_track_info(first_track)
+        
+        # Add to queue
+        SONG_QUEUES[guild_id_str].append((info["url"], info["title"], info["duration"]))
+        
+        # Create an embed response
+        embed = discord.Embed(
+            title="🎵 Track Added",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="Title", value=info["title"], inline=False)
+        
+        if info["duration"]:
+            embed.add_field(name="Duration", value=format_duration(info["duration"]), inline=True)
+            
+        if info["uploader"]:
+            embed.add_field(name="Uploader", value=info["uploader"], inline=True)
+            
+        # Add thumbnail if available
+        if info["thumbnail"]:
+            embed.set_thumbnail(url=info["thumbnail"])
+        
+        # Check if song is playing or queued
+        if voice_client.is_playing() or voice_client.is_paused():
+            queue_position = len(SONG_QUEUES[guild_id_str])
+            embed.description = f"Added to queue at position {queue_position}"
+            await interaction.followup.send(embed=embed)
+        else:
+            embed.description = "Starting playback"
+            await interaction.followup.send(embed=embed)
+            await play_next_song(voice_client, interaction.guild_id, interaction.channel)
+    
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {str(e)}")
+
+@bot.tree.command(name="pause", description="Pause the currently playing song.")
+async def pause(interaction: discord.Interaction):
+    voice_client = interaction.guild.voice_client
+    if voice_client is None:
+        return await interaction.response.send_message("❌ I'm not in a voice channel.")
+    
+    if not voice_client.is_playing():
+        return await interaction.response.send_message("❌ Nothing is currently playing.")
+    
+    voice_client.pause()
+    await interaction.response.send_message("⏸️ Playback paused!")
+
+@bot.tree.command(name="resume", description="Resume the currently paused song.")
+async def resume(interaction: discord.Interaction):
+    voice_client = interaction.guild.voice_client
+    if voice_client is None:
+        return await interaction.response.send_message("❌ I'm not in a voice channel.")
+    
+    if not voice_client.is_paused():
+        return await interaction.response.send_message("❌ I'm not paused right now.")
+    
+    voice_client.resume()
+    await interaction.response.send_message("▶️ Playback resumed!")
+
+@bot.tree.command(name="stop", description="Stop playback and clear the queue.")
+async def stop(interaction: discord.Interaction):
+    voice_client = interaction.guild.voice_client
+    if not voice_client or not voice_client.is_connected():
+        return await interaction.response.send_message("❌ I'm not connected to any voice channel.")
+    
+    guild_id_str = str(interaction.guild_id)
+    if guild_id_str in SONG_QUEUES:
+        SONG_QUEUES[guild_id_str].clear()
+    
+    if voice_client.is_playing() or voice_client.is_paused():
+        voice_client.stop()
+    
+    if guild_id_str in CURRENT_TRACKS:
+        del CURRENT_TRACKS[guild_id_str]
+    
+    await voice_client.disconnect()
+    await interaction.response.send_message("⏹️ Stopped playback and disconnected!")
+
+@bot.tree.command(name="skip", description="Skip the current playing song")
+async def skip(interaction: discord.Interaction):
+    voice_client = interaction.guild.voice_client
+    if not voice_client:
+        return await interaction.response.send_message("❌ I'm not in a voice channel.")
+    
+    if not (voice_client.is_playing() or voice_client.is_paused()):
+        return await interaction.response.send_message("❌ Not playing anything to skip.")
+    
+    voice_client.stop()  # This will trigger the after callback that plays the next song
+    await interaction.response.send_message("⏭️ Skipped the current song.")
+
+@bot.tree.command(name="rewind", description="Restart the current song")
+async def rewind(interaction: discord.Interaction):
+    voice_client = interaction.guild.voice_client
+    if not voice_client:
+        return await interaction.response.send_message("❌ I'm not in a voice channel.")
+    
+    guild_id_str = str(interaction.guild_id)
+    if guild_id_str not in CURRENT_TRACKS:
+        return await interaction.response.send_message("❌ Nothing is currently playing.")
+    
+    # Get current track info
+    current = CURRENT_TRACKS[guild_id_str]
+    
+    # Stop current playback
+    voice_client.stop()
+    
+    # Add the current song to the front of the queue
+    SONG_QUEUES[guild_id_str].appendleft((current["url"], current["title"], current["duration"]))
+    
+    # The after_play callback will automatically play the next song (which is the current song now)
+    await interaction.response.send_message("⏮️ Rewinding to the start of the current song.")
+
+@bot.tree.command(name="seek", description="Seek to a specific position in the current song (Not fully implemented)")
+@app_commands.describe(position="Position in seconds or in mm:ss format")
+async def seek(interaction: discord.Interaction, position: str):
+    # Note: This is a placeholder. True seeking requires more complex implementation
+    # Discord.py doesn't support seeking directly, so we'd need to restart the song
+    # with a starting position parameter passed to FFmpeg
+    
+    await interaction.response.send_message(
+        "⚠️ Seeking is not fully implemented in this version. This would require restarting the song from the specified position."
+    )
+
+@bot.tree.command(name="repeat", description="Toggle repeat mode for the current queue")
+async def repeat(interaction: discord.Interaction):
+    guild_id_str = str(interaction.guild_id)
+    
+    # Simple implementation: Just add the current song back to the queue
+    if guild_id_str not in CURRENT_TRACKS:
+        return await interaction.response.send_message("❌ Nothing is currently playing to repeat.")
+    
+    current = CURRENT_TRACKS[guild_id_str]
+    
+    # Add to queue
+    if guild_id_str not in SONG_QUEUES:
+        SONG_QUEUES[guild_id_str] = deque()
+    
+    SONG_QUEUES[guild_id_str].append((current["url"], current["title"], current["duration"]))
+    
+    # Confirm to user
+    await interaction.response.send_message(f"🔁 Added **{current['title']}** to the end of the queue for repeat.")
+
+@bot.tree.command(name="shuffle", description="Shuffle the current queue")
+async def shuffle(interaction: discord.Interaction):
+    guild_id_str = str(interaction.guild_id)
+    
+    if guild_id_str not in SONG_QUEUES or not SONG_QUEUES[guild_id_str]:
+        return await interaction.response.send_message("❌ Queue is empty. Nothing to shuffle.")
+    
+    # Convert deque to list for shuffling
+    queue_list = list(SONG_QUEUES[guild_id_str])
+    random.shuffle(queue_list)
+    
+    # Replace the queue with the shuffled list
+    SONG_QUEUES[guild_id_str] = deque(queue_list)
+    
+    await interaction.response.send_message(f"🔀 Shuffled the queue. There are {len(queue_list)} songs in the queue.")
+
+@bot.tree.command(name="playnext", description="Add a song to the front of the queue")
+@app_commands.describe(song_query="Search query or YouTube URL")
+async def play_next(interaction: discord.Interaction, song_query: str):
+    await interaction.response.defer()
+    
+    # Check if user is in a voice channel
+    if not interaction.user.voice:
+        return await interaction.followup.send("❌ You must be in a voice channel to use this command.")
+    
+    guild_id_str = str(interaction.guild_id)
+    
+    # Set up queue if it doesn't exist
+    if guild_id_str not in SONG_QUEUES:
+        SONG_QUEUES[guild_id_str] = deque()
+    
+    # Handle URL or search query
+    query = song_query
+    if not query.startswith("http"):
+        query = "ytsearch1:" + song_query
+    
+    try:
+        results = await search_ytdlp_async(query, ydl_opts_base)
+        
+        if "entries" in results:
+            tracks = results["entries"]
+            if not tracks:
+                return await interaction.followup.send("❌ No results found.")
+            
+            first_track = tracks[0]
+        else:
+            first_track = results
+        
+        info = get_track_info(first_track)
+        
+        # Add to the front of the queue
+        SONG_QUEUES[guild_id_str].appendleft((info["url"], info["title"], info["duration"]))
+        
+        # Create an embed response
+        embed = discord.Embed(
+            title="🎵 Track Added to Front of Queue",
+            description=f"**{info['title']}** will play next",
+            color=discord.Color.blue()
+        )
+        
+        if info["duration"]:
+            embed.add_field(name="Duration", value=format_duration(info["duration"]), inline=True)
+            
+        if info["thumbnail"]:
+            embed.set_thumbnail(url=info["thumbnail"])
+        
+        await interaction.followup.send(embed=embed)
+        
+        # If not playing, start playback
+        voice_client = interaction.guild.voice_client
+        if voice_client and not (voice_client.is_playing() or voice_client.is_paused()):
+            await play_next_song(voice_client, interaction.guild_id, interaction.channel)
+    
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {str(e)}")
+
+@bot.tree.command(name="skipto", description="Skip to a specific song in the queue")
+@app_commands.describe(position="Position in the queue (1-based)")
+async def skip_to(interaction: discord.Interaction, position: int):
+    guild_id_str = str(interaction.guild_id)
+    
+    if guild_id_str not in SONG_QUEUES or not SONG_QUEUES[guild_id_str]:
+        return await interaction.response.send_message("❌ Queue is empty.")
+    
+    if position < 1 or position > len(SONG_QUEUES[guild_id_str]):
+        return await interaction.response.send_message(f"❌ Invalid position. Queue has {len(SONG_QUEUES[guild_id_str])} songs.")
+    
+    # Get the requested song
+    queue_list = list(SONG_QUEUES[guild_id_str])
+    requested_song = queue_list[position - 1]
+    
+    # Clear the queue and add songs from the requested position
+    SONG_QUEUES[guild_id_str] = deque(queue_list[position - 1:])
+    
+    # Stop current playback to start the new song
+    voice_client = interaction.guild.voice_client
+    if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
+        voice_client.stop()
+    
+    await interaction.response.send_message(f"⏭️ Skipping to **{requested_song[1]}**")
+
+@bot.tree.command(name="nowplaying", description="Show information about the currently playing song")
+async def now_playing(interaction: discord.Interaction):
+    guild_id_str = str(interaction.guild_id)
+    
+    if guild_id_str not in CURRENT_TRACKS:
+        return await interaction.response.send_message("❌ Nothing is currently playing.")
+    
+    current = CURRENT_TRACKS[guild_id_str]
+    
+    # Calculate elapsed time
+    elapsed = time.time() - current["started_at"]
+    elapsed_str = format_duration(elapsed)
+    duration_str = format_duration(current["duration"]) if current["duration"] else "Unknown"
+    
+    # Create progress bar (if duration is known)
+    progress_bar = ""
+    progress_percent = 0
+    
+    if current["duration"]:
+        progress_percent = min(100, int((elapsed / current["duration"]) * 100))
+        bar_length = 20
+        filled_length = int(bar_length * progress_percent / 100)
+        progress_bar = "▓" * filled_length + "░" * (bar_length - filled_length)
+    
+    # Create embed
+    embed = discord.Embed(
+        title="🎵 Now Playing",
+        description=f"**{current['title']}**",
+        color=discord.Color.green()
+    )
+    
+    if progress_bar:
+        embed.add_field(
+            name=f"Progress: {progress_percent}%",
+            value=f"`{elapsed_str} {progress_bar} {duration_str}`",
+            inline=False
+        )
+    else:
+        embed.add_field(name="Time", value=f"Elapsed: {elapsed_str}", inline=True)
+    
+    await interaction.response.send_message(embed=embed)
+
+# Queue Management
+@bot.tree.command(name="queue", description="Show the current queue")
+async def queue(interaction: discord.Interaction):
+    guild_id_str = str(interaction.guild_id)
+    
+    if guild_id_str not in SONG_QUEUES or not SONG_QUEUES[guild_id_str]:
+        return await interaction.response.send_message("❌ Queue is empty.")
+    
+    # Create embed
+    embed = discord.Embed(
+        title="🎵 Current Queue",
+        color=discord.Color.blue()
+    )
+    
+    # Add current track if playing
+    if guild_id_str in CURRENT_TRACKS:
+        current = CURRENT_TRACKS[guild_id_str]
+        embed.add_field(
+            name="▶️ Now Playing",
+            value=f"**{current['title']}** ({format_duration(current['duration'])})",
+            inline=False
+        )
+    
+    # Add queue tracks (up to 10 to avoid message length limits)
+    queue_list = list(SONG_QUEUES[guild_id_str])
+    queue_text = ""
+    
+    for i, (_, title, duration) in enumerate(queue_list[:10]):
+        duration_str = format_duration(duration) if duration else "Unknown"
+        queue_text += f"{i+1}. **{title}** ({duration_str})\n"
+    
+    if queue_list:
+        if len(queue_list) > 10:
+            queue_text += f"... and {len(queue_list) - 10} more songs"
+        
+        embed.add_field(name="📋 Queue", value=queue_text, inline=False)
+        
+        # Add total duration
+        total_duration = calculate_queue_time(interaction.guild_id)
+        embed.add_field(name="⏱️ Total Queue Duration", value=format_duration(total_duration), inline=True)
+        embed.add_field(name="🔢 Total Songs", value=str(len(queue_list)), inline=True)
+    
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="clearqueue", description="Clear the current queue")
+async def clear_queue(interaction: discord.Interaction):
+    guild_id_str = str(interaction.guild_id)
+    
+    if guild_id_str not in SONG_QUEUES or not SONG_QUEUES[guild_id_str]:
+        return await interaction.response.send_message("❌ Queue is already empty.")
+    
+    SONG_QUEUES[guild_id_str].clear()
+    await interaction.response.send_message("🧹 Queue has been cleared.")
+
+@bot.tree.command(name="queuetime", description="Estimate total time for the current queue")
+async def queue_time_estimator(interaction: discord.Interaction):
+    guild_id_str = str(interaction.guild_id)
+    
+    if guild_id_str not in SONG_QUEUES or not SONG_QUEUES[guild_id_str]:
+        return await interaction.response.send_message("❌ Queue is empty.")
+    
+    # Calculate total queue time
+    total_duration = calculate_queue_time(interaction.guild_id)
+    
+    # Calculate estimated time of completion
+    completion_time = time.time() + total_duration
+    completion_str = time.strftime("%H:%M:%S", time.localtime(completion_time))
+    
+    # Create embed
+    embed = discord.Embed(
+        title="⏱️ Queue Time Estimator",
+        color=discord.Color.blue()
+    )
+    
+    embed.add_field(name="Total Queue Duration", value=format_duration(total_duration), inline=True)
+    embed.add_field(name="Estimated Completion", value=f"~{completion_str}", inline=True)
+    embed.add_field(name="Queue Size", value=f"{len(SONG_QUEUES[guild_id_str])} songs", inline=True)
+    
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="songrequest", description="Request a song to be added to the queue")
+@app_commands.describe(song_query="Song to request")
+async def song_request(interaction: discord.Interaction, song_query: str):
+    # This is similar to play but with a different user experience/messaging
+    await interaction.response.defer()
+    
+    # Check if user is in a voice channel
+    if not interaction.user.voice:
+        return await interaction.followup.send("❌ You must be in a voice channel to request songs.")
+    
+    voice_channel = interaction.user.voice.channel
+    guild_id_str = str(interaction.guild_id)
+    
+    # Connect to the voice channel if not already connected
+    voice_client = interaction.guild.voice_client
+    if voice_client is None:
+        voice_client = await voice_channel.connect()
+    elif voice_channel != voice_client.channel:
+        if guild_id_str in VOICE_CHANNEL_LOCKS and VOICE_CHANNEL_LOCKS[guild_id_str]:
+            return await interaction.followup.send("❌ Voice channel is locked. Cannot join your channel.")
+        await voice_client.move_to(voice_channel)
+    
+    # Set up queue if it doesn't exist
+    if guild_id_str not in SONG_QUEUES:
+        SONG_QUEUES[guild_id_str] = deque()
+    
+    # Handle search query
+    query = "ytsearch1:" + song_query
+    
+    try:
+        results = await search_ytdlp_async(query, ydl_opts_base)
+        
+        if "entries" in results:
+            tracks = results["entries"]
+            if not tracks:
+                return await interaction.followup.send("❌ No results found for your request.")
+            
+            first_track = tracks[0]
+        else:
+            first_track = results
+        
+        info = get_track_info(first_track)
+        
+        # Add to queue
+        SONG_QUEUES[guild_id_str].append((info["url"], info["title"], info["duration"]))
+        
+        # Create a response embed
+        embed = discord.Embed(
+            title="🎵 Song Request Added",
+            description=f"**{info['title']}** has been added to the queue by {interaction.user.mention}",
+            color=discord.Color.green()
+        )
+        
+        if info["duration"]:
+            embed.add_field(name="Duration", value=format_duration(info["duration"]), inline=True)
+        
+        queue_position = len(SONG_QUEUES[guild_id_str])
+        if voice_client.is_playing() or voice_client.is_paused():
+            embed.add_field(name="Queue Position", value=str(queue_position), inline=True)
+            estimated_time = calculate_queue_time(interaction.guild_id) - info["duration"]
+            embed.add_field(name="Estimated Wait", value=format_duration(estimated_time), inline=True)
+        else:
+            embed.add_field(name="Status", value="Playing next", inline=True)
+        
+        await interaction.followup.send(embed=embed)
+        
+        # Start playback if nothing is playing
+        if not voice_client.is_playing() and not voice_client.is_paused():
+            await play_next_song(voice_client, interaction.guild_id, interaction.channel)
+            
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error processing song request: {str(e)}")
+
+@bot.tree.command(name="vote", description="Vote for the next song (placeholder)")
+@app_commands.describe(option="Option number to vote for")
+async def live_song_voting(interaction: discord.Interaction, option: int = None):
+    # This is a placeholder for live song voting
+    # In a full implementation, this would track votes for multiple song options
+    
+    await interaction.response.send_message(
+        "🗳️ Live song voting feature is a placeholder in this version. " +
+        "In a full implementation, this would allow users to vote on the next song to play."
+    )
+
+# Volume & Audio Controls
+@bot.tree.command(name="volume", description="Set volume between 1 and 100")
+@app_commands.describe(level="Volume level (1 to 100)")
+async def volume(interaction: discord.Interaction, level: int):
+    if not 1 <= level <= 100:
+        return await interaction.response.send_message("❌ Volume must be between 1 and 100.")
+    
+    guild_id_str = str(interaction.guild_id)
+    VOLUME_LEVELS[guild_id_str] = level / 100.0
+    
+    voice_client = interaction.guild.voice_client
+    if voice_client and voice_client.source and isinstance(voice_client.source, discord.PCMVolumeTransformer):
+        voice_client.source.volume = VOLUME_LEVELS[guild_id_str]
+    
+    # Create volume bars visualization
+    volume_bars = "▓" * (level // 5) + "░" * ((100 - level) // 5)
+    
+    await interaction.response.send_message(f"🎚️ Volume set to {level}%\n`{volume_bars}`")
+
+@bot.tree.command(name="volumelimiter", description="Enable volume limiting to prevent audio clipping")
+@app_commands.describe(enabled="Enable or disable the volume limiter")
+async def volume_limiter(interaction: discord.Interaction, enabled: bool):
+    guild_id_str = str(interaction.guild_id)
+    
+    # This would require additional FFmpeg filters in a full implementation
+    await interaction.response.send_message(
+        f"🎚️ Volume limiter {'enabled' if enabled else 'disabled'}. " +
+        "This would prevent audio clipping and normalize volume in a full implementation."
+    )
+
+@bot.tree.command(name="balance", description="Set left/right channel balance")
+@app_commands.describe(left="Left channel volume (0-100)", right="Right channel volume (0-100)")
+async def volume_balance(interaction: discord.Interaction, left: int, right: int):
+    if not (0 <= left <= 100 and 0 <= right <= 100):
+        return await interaction.response.send_message("❌ Channel volumes must be between 0 and 100.")
+    
+    guild_id_str = str(interaction.guild_id)
+    AUDIO_BALANCE[guild_id_str] = (left / 100.0, right / 100.0)
+    
+    # This would require additional FFmpeg filters to implement properly
+    await interaction.response.send_message(
+        f"⚖️ Audio balance set to L: {left}% | R: {right}%\n" +
+        "Balance changes would be applied to the audio stream in a full implementation."
+    )
+
+@bot.tree.command(name="equalizer", description="Adjust audio equalizer settings")
+async def equalizer(interaction: discord.Interaction):
+    # This would normally provide an interactive UI to adjust EQ bands
+    # For our implementation, we'll provide a simpler response
+    
+    await interaction.response.send_message(
+        "🎛️ Equalizer functionality would allow adjusting different frequency bands in a full implementation.\n" +
+        "This would use FFmpeg's 'equalizer' audio filter with custom frequency bands."
+    )
+
+@bot.tree.command(name="bassboost", description="Toggle bass boost effect")
+async def bass_boost(interaction: discord.Interaction):
+    guild_id_str = str(interaction.guild_id)
+    
+    # Check if the filter is already active
+    if guild_id_str not in FILTERS:
+        FILTERS[guild_id_str] = []
+    
+    if "bassboost" in FILTERS[guild_id_str]:
+        FILTERS[guild_id_str].remove("bassboost")
+        status = "disabled"
+    else:
+        FILTERS[guild_id_str].append("bassboost")
+        status = "enabled"
+    
+    voice_client = interaction.guild.voice_client
+    
+    # For a real implementation, we would need to restart the current song with new filters
+    if voice_client and voice_client.is_playing():
+        await interaction.response.send_message(
+            f"🔊 Bass boost {status}. Effect will apply to the next song."
+        )
+    else:
+        await interaction.response.send_message(f"🔊 Bass boost {status}.")
+
+@bot.tree.command(name="nightcore", description="Toggle nightcore effect (increases speed and pitch)")
+async def nightcore(interaction: discord.Interaction):
+    guild_id_str = str(interaction.guild_id)
+    
+    # Toggle nightcore status
+    NIGHTCORE_ENABLED[guild_id_str] = not NIGHTCORE_ENABLED.get(guild_id_str, False)
+    status = "enabled" if NIGHTCORE_ENABLED[guild_id_str] else "disabled"
+    
+    # For a real implementation, we would need to restart the current song with new filters
+    await interaction.response.send_message(
+        f"🎛️ Nightcore effect {status}. Effect will apply to the next song."
+    )
+
+@bot.tree.command(name="crossfade", description="Enable crossfade between songs")
+@app_commands.describe(duration="Crossfade duration in seconds (0 to disable)")
+async def crossfade(interaction: discord.Interaction, duration: int):
+    if duration < 0:
+        return await interaction.response.send_message("❌ Crossfade duration must be positive.")
+    
+    await interaction.response.send_message(
+        f"🎛️ Crossfade {'enabled with ' + str(duration) + 's duration' if duration > 0 else 'disabled'}.\n" +
+        "This would smoothly transition between songs in a full implementation."
+    )
+
+@bot.tree.command(name="visualize", description="Toggle audio visualization")
+async def audio_visualization(interaction: discord.Interaction):
+    guild_id_str = str(interaction.guild_id)
+    
+    # Toggle visualizer status
+    VISUALIZER_ACTIVE[guild_id_str] = not VISUALIZER_ACTIVE.get(guild_id_str, False)
+    status = "enabled" if VISUALIZER_ACTIVE[guild_id_str] else "disabled"
+    
+    await interaction.response.send_message(
+        f"📊 Audio visualization {status}.\n" +
+        "This would display a visual representation of the audio in a full implementation."
+    )
+
+# Playlist & Song Features
+@bot.tree.command(name="createplaylist", description="Create a custom playlist")
+@app_commands.describe(name="Name of the playlist")
+async def create_playlist(interaction: discord.Interaction, name: str):
+    user_id_str = str(interaction.user.id)
+    
+    if user_id_str not in CUSTOM_PLAYLISTS:
+        CUSTOM_PLAYLISTS[user_id_str] = {}
+    
+    if name in CUSTOM_PLAYLISTS[user_id_str]:
+        return await interaction.response.send_message(f"❌ You already have a playlist named '{name}'.")
+    
+    CUSTOM_PLAYLISTS[user_id_str][name] = []
+    save_data()  # Save playlist data
+    
+    await interaction.response.send_message(f"📝 Created new playlist: **{name}**")
+
+@bot.tree.command(name="addtoplaylist", description="Add current song to a playlist")
+@app_commands.describe(playlist_name="Name of your playlist")
+async def add_to_playlist(interaction: discord.Interaction, playlist_name: str):
+    user_id_str = str(interaction.user.id)
+    guild_id_str = str(interaction.guild_id)
+    
+    # Check if user has playlists
+    if user_id_str not in CUSTOM_PLAYLISTS:
+        return await interaction.response.send_message("❌ You don't have any playlists. Create one first with `/createplaylist`.")
+    
+    # Check if playlist exists
+    if playlist_name not in CUSTOM_PLAYLISTS[user_id_str]:
+        return await interaction.response.send_message(f"❌ You don't have a playlist named '{playlist_name}'.")
+    
+    # Check if something is playing
+    if guild_id_str not in CURRENT_TRACKS:
+        return await interaction.response.send_message("❌ Nothing is currently playing to add to playlist.")
+    
+    # Add current song to playlist
+    current = CURRENT_TRACKS[guild_id_str]
+    song_info = {
+        "url": current["url"],
+        "title": current["title"],
+        "duration": current["duration"]
+    }
+    
+    CUSTOM_PLAYLISTS[user_id_str][playlist_name].append(song_info)
+    save_data()  # Save playlist data
+    
+    await interaction.response.send_message(f"✅ Added **{current['title']}** to playlist '{playlist_name}'.")
+
+@bot.tree.command(name="playlist", description="Load and play a custom playlist")
+@app_commands.describe(playlist_name="Name of the playlist to play")
+async def play_playlist(interaction: discord.Interaction, playlist_name: str):
+    await interaction.response.defer()
+    
+    user_id_str = str(interaction.user.id)
+    guild_id_str = str(interaction.guild_id)
+    
+    # Check if user has playlists
+    if user_id_str not in CUSTOM_PLAYLISTS:
+        return await interaction.followup.send("❌ You don't have any playlists.")
+    
+    # Check if playlist exists
+    if playlist_name not in CUSTOM_PLAYLISTS[user_id_str]:
+        return await interaction.followup.send(f"❌ You don't have a playlist named '{playlist_name}'.")
+    
+    # Check if playlist has songs
+    if not CUSTOM_PLAYLISTS[user_id_str][playlist_name]:
+        return await interaction.followup.send(f"❌ Playlist '{playlist_name}' is empty.")
+    
+    # Check if user is in a voice channel
+    if not interaction.user.voice:
+        return await interaction.followup.send("❌ You must be in a voice channel to play a playlist.")
+    
+    voice_channel = interaction.user.voice.channel
+    
+    # Connect to the voice channel if not already connected
+    voice_client = interaction.guild.voice_client
+    if voice_client is None:
+        voice_client = await voice_channel.connect()
+    elif voice_channel != voice_client.channel:
+        # Check for voice channel lock
+        if guild_id_str in VOICE_CHANNEL_LOCKS and VOICE_CHANNEL_LOCKS[guild_id_str]:
+            if voice_client.channel != voice_channel:
+                return await interaction.followup.send("❌ Voice channel is locked.")
+        else:
+            await voice_client.move_to(voice_channel)
+    
+    # Set up queue if it doesn't exist
+    if guild_id_str not in SONG_QUEUES:
+        SONG_QUEUES[guild_id_str] = deque()
+    
+    # Add playlist songs to queue
+    playlist = CUSTOM_PLAYLISTS[user_id_str][playlist_name]
+    added_count = 0
+    
+    for song in playlist:
+        SONG_QUEUES[guild_id_str].append((song["url"], song["title"], song["duration"]))
+        added_count += 1
+    
+    # Start playback if not already playing
+    if not voice_client.is_playing() and not voice_client.is_paused():
+        await play_next_song(voice_client, interaction.guild_id, interaction.channel)
+    
+    await interaction.followup.send(f"🎵 Added {added_count} songs from playlist '{playlist_name}' to the queue.")
+
+@bot.tree.command(name="trackinfo", description="Show detailed information about the current track")
+async def track_info(interaction: discord.Interaction):
+    guild_id_str = str(interaction.guild_id)
+    
+    if guild_id_str not in CURRENT_TRACKS:
+        return await interaction.response.send_message("❌ Nothing is currently playing.")
+    
+    current = CURRENT_TRACKS[guild_id_str]
+    
+    # Create embed
+    embed = discord.Embed(
+        title="🎵 Track Information",
+        description=f"**{current['title']}**",
+        color=discord.Color.blue()
+    )
+    
+    # Calculate elapsed time
+    elapsed = time.time() - current["started_at"]
+    elapsed_str = format_duration(elapsed)
+    duration_str = format_duration(current["duration"]) if current["duration"] else "Unknown"
+    
+    embed.add_field(name="Time", value=f"{elapsed_str} / {duration_str}", inline=True)
+    
+    # For a full implementation, we would fetch more track details
+    # like artist, album, release date, genre, etc.
+    
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="lyrics", description="Show lyrics for the current song (placeholder)")
+async def lyrics(interaction: discord.Interaction):
+    guild_id_str = str(interaction.guild_id)
+    
+    if guild_id_str not in CURRENT_TRACKS:
+        return await interaction.response.send_message("❌ Nothing is currently playing.")
+    
+    current = CURRENT_TRACKS[guild_id_str]
+    
+    # This would normally fetch lyrics from a lyrics API
+    await interaction.response.send_message(
+        f"🎵 Lyrics for **{current['title']}**\n\n" +
+        "In a full implementation, this would fetch lyrics from a lyrics API or database."
+    )
+
+@bot.tree.command(name="search", description="Advanced lyrics search (placeholder)")
+@app_commands.describe(query="Lyrics to search for")
+async def lyrics_search(interaction: discord.Interaction, query: str):
+    # This would normally search for songs containing specific lyrics
+    await interaction.response.send_message(
+        f"🔍 Searching for songs containing: '{query}'\n\n" +
+        "In a full implementation, this would search a lyrics database and return matching songs."
+    )
+
+@bot.tree.command(name="rate", description="Rate the current song (1-5 stars)")
+@app_commands.describe(rating="Rating from 1 to 5 stars")
+async def rate_song(interaction: discord.Interaction, rating: int):
+    if not 1 <= rating <= 5:
+        return await interaction.response.send_message("❌ Rating must be between 1 and 5 stars.")
+    
+    guild_id_str = str(interaction.guild_id)
+    user_id_str = str(interaction.user.id)
+    
+    if guild_id_str not in CURRENT_TRACKS:
+        return await interaction.response.send_message("❌ Nothing is currently playing to rate.")
+    
+    current = CURRENT_TRACKS[guild_id_str]
+    song_id = current.get("url", "")
+    
+    # Store rating
+    if song_id:
+        if song_id not in SONG_RATINGS:
+            SONG_RATINGS[song_id] = {}
+        
+        SONG_RATINGS[song_id][user_id_str] = rating
+        save_data()  # Save ratings
+        
+        # Calculate average rating
+        ratings = SONG_RATINGS[song_id].values()
+        avg_rating = sum(ratings) / len(ratings)
+        
+        # Create star display
+        stars = "⭐" * rating
+        
+        await interaction.response.send_message(
+            f"Thank you for rating **{current['title']}**!\n" +
+            f"Your rating: {stars} ({rating}/5)\n" +
+            f"Average rating: {avg_rating:.1f}/5 from {len(ratings)} ratings"
+        )
+    else:
+        await interaction.response.send_message("❌ Could not identify the current song to rate.")
+
+# User Interaction & Modes
+@bot.tree.command(name="djmode", description="Toggle DJ mode (only authorized users can control music)")
+@app_commands.describe(enabled="Enable or disable DJ mode")
+async def dj_mode(interaction: discord.Interaction, enabled: bool):
+    # This would normally set permissions for who can control the bot
+    await interaction.response.send_message(
+        f"🎧 DJ Mode {'enabled' if enabled else 'disabled'}.\n" +
+        "In a full implementation, this would restrict music control to users with a DJ role."
+    )
+
+@bot.tree.command(name="game", description="Start a music guessing game")
+async def music_game(interaction: discord.Interaction):
+    guild_id_str = str(interaction.guild_id)
+    
+    # Check if a game is already active
+    if guild_id_str in ACTIVE_GAME_SESSIONS:
+        return await interaction.response.send_message("❌ A music game is already in progress.")
+    
+    await interaction.response.send_message(
+        "🎮 Music guessing game!\n\n" +
+        "In a full implementation, this would play short clips of songs and users would guess the title/artist."
+    )
+    
+    # Set up a dummy game session
+    ACTIVE_GAME_SESSIONS[guild_id_str] = {
+        "active": True,
+        "started_by": interaction.user.id
+    }
+
+# Voice Channel Functions
+@bot.tree.command(name="join", description="Join your voice channel")
+async def join(interaction: discord.Interaction):
+    if not interaction.user.voice:
+        return await interaction.response.send_message("❌ You must be in a voice channel first.")
+    
+    voice_channel = interaction.user.voice.channel
+    guild_id_str = str(interaction.guild_id)
+    
+    # Check for voice channel lock
+    if guild_id_str in VOICE_CHANNEL_LOCKS and VOICE_CHANNEL_LOCKS[guild_id_str]:
+        if interaction.guild.voice_client and interaction.guild.voice_client.channel != voice_channel:
+            return await interaction.response.send_message("❌ Voice channel is locked. Cannot join your channel.")
+    
+    # Connect to voice channel
+    try:
+        if interaction.guild.voice_client is None:
+            await voice_channel.connect()
+        else:
+            await interaction.guild.voice_client.move_to(voice_channel)
+        
+        await interaction.response.send_message(f"✅ Joined {voice_channel.mention}")
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error joining voice channel: {str(e)}")
+
+@bot.tree.command(name="leave", description="Leave the voice channel")
+async def leave(interaction: discord.Interaction):
+    voice_client = interaction.guild.voice_client
+    if voice_client is None:
+        return await interaction.response.send_message("❌ I'm not in a voice channel.")
+    
+    # Stop playback and clear queue
+    guild_id_str = str(interaction.guild_id)
+    if guild_id_str in SONG_QUEUES:
+        SONG_QUEUES[guild_id_str].clear()
+    
+    if voice_client.is_playing() or voice_client.is_paused():
+        voice_client.stop()
+    
+    # Disconnect
+    await voice_client.disconnect()
+    await interaction.response.send_message("👋 Left the voice channel.")
+
+@bot.tree.command(name="lock", description="Lock the bot to the current voice channel")
+@app_commands.describe(enabled="Enable or disable voice channel lock")
+async def lock_channel(interaction: discord.Interaction, enabled: bool):
+    guild_id_str = str(interaction.guild_id)
+    voice_client = interaction.guild.voice_client
+    
+    if enabled and not voice_client:
+        return await interaction.response.send_message("❌ I'm not in a voice channel to lock.")
+    
+    VOICE_CHANNEL_LOCKS[guild_id_str] = enabled
+    save_data()  # Save lock status
+    
+    if enabled:
+        channel_name = voice_client.channel.name
+        await interaction.response.send_message(f"🔒 Locked to voice channel '{channel_name}'.")
+    else:
+        await interaction.response.send_message("🔓 Voice channel lock disabled.")
+
+@bot.tree.command(name="autojoin", description="Set bot to automatically join your voice channel")
+@app_commands.describe(enabled="Enable or disable auto-join")
+async def auto_join(interaction: discord.Interaction, enabled: bool):
+    user_id_str = str(interaction.user.id)
+    guild_id_str = str(interaction.guild_id)
+    
+    if enabled:
+        if not interaction.user.voice:
+            return await interaction.response.send_message("❌ You must be in a voice channel to enable auto-join.")
+        
+        voice_channel_id = str(interaction.user.voice.channel.id)
+        
+        if user_id_str not in AUTO_JOIN_CHANNELS:
+            AUTO_JOIN_CHANNELS[user_id_str] = {}
+        
+        AUTO_JOIN_CHANNELS[user_id_str][guild_id_str] = voice_channel_id
+        channel_name = interaction.user.voice.channel.name
+        
+        await interaction.response.send_message(f"🔄 Auto-join enabled for channel '{channel_name}'.")
+    else:
+        if user_id_str in AUTO_JOIN_CHANNELS and guild_id_str in AUTO_JOIN_CHANNELS[user_id_str]:
+            del AUTO_JOIN_CHANNELS[user_id_str][guild_id_str]
+            
+            # Clean up empty entries
+            if not AUTO_JOIN_CHANNELS[user_id_str]:
+                del AUTO_JOIN_CHANNELS[user_id_str]
+            
+            await interaction.response.send_message("🛑 Auto-join disabled.")
+        else:
+            await interaction.response.send_message("❌ You don't have auto-join enabled.")
+    
+    save_data()  # Save auto-join preferences
+
+# Enhancements & Filters
+@bot.tree.command(name="filters", description="Apply audio filters to enhance your music experience")
+@app_commands.describe(filter_name="The audio filter to toggle")
+@app_commands.choices(filter_name=[
+    app_commands.Choice(name="Bass Boost", value="bassboost"),
+    app_commands.Choice(name="Nightcore", value="nightcore"),
+    app_commands.Choice(name="8D Audio", value="8d"),
+    app_commands.Choice(name="Vaporwave", value="vaporwave"),
+    app_commands.Choice(name="Tremolo", value="tremolo"),
+    app_commands.Choice(name="Vibrato", value="vibrato"),
+    app_commands.Choice(name="Reverse", value="reverse"),
+    app_commands.Choice(name="Normalizer", value="normalizer"),
+    app_commands.Choice(name="Echo", value="echo")
+])
+async def filters(interaction: discord.Interaction, filter_name: str):
+    guild_id_str = str(interaction.guild_id)
+    
+    # Initialize filters for guild if not exists
+    if guild_id_str not in FILTERS:
+        FILTERS[guild_id_str] = []
+    
+    # Toggle filter
+    if filter_name in FILTERS[guild_id_str]:
+        FILTERS[guild_id_str].remove(filter_name)
+        status = "disabled"
+    else:
+        FILTERS[guild_id_str].append(filter_name)
+        status = "enabled"
+    
+    # Create embed with active filters
+    embed = discord.Embed(
+        title="🎛️ Audio Filters",
+        description=f"**{filter_name}** filter {status}",
+        color=discord.Color.blue()
+    )
+    
+    # List active filters
+    active_filters = FILTERS[guild_id_str]
+    if active_filters:
+        embed.add_field(
+            name="Active Filters",
+            value=", ".join(active_filters),
+            inline=False
+        )
+    else:
+        embed.add_field(
+            name="Active Filters",
+            value="None",
+            inline=False
+        )
+    
+    embed.set_footer(text="Filters will apply to new songs. Some filters may increase CPU usage.")
+    
+    await interaction.response.send_message(embed=embed)
+
+# Miscellaneous
+@bot.tree.command(name="language", description="Set your preferred language")
+@app_commands.describe(language_code="Language code")
+@app_commands.choices(language_code=[
+    app_commands.Choice(name="English", value="en"),
+    app_commands.Choice(name="Spanish", value="es"),
+    app_commands.Choice(name="French", value="fr"),
+    app_commands.Choice(name="German", value="de"),
+    app_commands.Choice(name="Italian", value="it"),
+    app_commands.Choice(name="Portuguese", value="pt"),
+    app_commands.Choice(name="Russian", value="ru"),
+    app_commands.Choice(name="Japanese", value="ja"),
+    app_commands.Choice(name="Korean", value="ko"),
+    app_commands.Choice(name="Chinese", value="zh"),
+    app_commands.Choice(name="Dutch", value="nl")
+])
+async def set_language(interaction: discord.Interaction, language_code: str):
+    user_id_str = str(interaction.user.id)
+    
+    # Store language preference
+    LANGUAGE_PREFERENCES[user_id_str] = language_code
+    save_data()  # Save language preferences
+    
+    language_name = SUPPORTED_LANGUAGES.get(language_code, "Unknown")
+    await interaction.response.send_message(f"🌐 Language preference set to {language_name}.")
+
+@bot.tree.command(name="audioquality", description="Set audio quality for playback")
+@app_commands.describe(quality="Audio quality level")
+@app_commands.choices(quality=[
+    app_commands

@@ -1,5 +1,5 @@
 discord.py>=2.0.0
-yt-dlp
+yt-dlp==2023.11.16  # Latest stable version
 python-dotenv
 Flask  # Only if using keep_alive
 PyNaCl==1.5.0
